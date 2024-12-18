@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+
+"""     DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+                    Version 2, December 2004
+
+ Copyright (C) 2004 Sam Hocevar <sam@hocevar.net>
+
+ Everyone is permitted to copy and distribute verbatim or modified
+ copies of this license document, and changing it is allowed as long
+ as the name is changed.
+
+            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
+   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
+
+  0. You just DO WHAT THE FUCK YOU WANT TO.
+"""
+
+# Tool to configure OTPC-P2-i Token from https://token2.com/
+
+# Disclaimer: This program comes without any warranty.
+
+# Requirements:
+#   PN533 NFC Writer. Tested with "StickID Writer" from token2.
+#   OTPC-P2-i Token.
+#   python: 3.11 or later
+#   pypi packages: nfcpy, sm4  (use a venv!)
+
+# Don't run as root. Add udev rule:
+#   ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="04cc", ATTRS{idProduct}=="2533", OWNER="root", GROUP="plugdev", MODE="0660"
+
+from argparse import ArgumentParser
+from base64 import b32decode
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import IntEnum
+from sys import stderr
+from time import sleep, time
+from traceback import print_exc
+from typing import Self
+from usb1 import USBDeviceHandle
+
+import nfc
+from sm4 import SM4Key
+
+
+# Linux loads "nfc" module. Conflicts with direct USB access.
+def claim_monkey(self: USBDeviceHandle, interface: int):
+    self.setAutoDetachKernelDriver(True)
+    return self.real_claim_interface(interface)
+
+USBDeviceHandle.real_claim_interface = USBDeviceHandle.claimInterface
+USBDeviceHandle.claimInterface = claim_monkey
+
+
+class NoTokenException(Exception):
+    pass
+
+
+class TimeStep(IntEnum):
+    # rfc6238 defines nonstandard time steps. Token supports 30 or 60 seconds.
+    T_30 = 1
+    T_60 = 2
+
+
+class HmacAlgorithm(IntEnum):
+    # Which Hash algorithm?
+    SHA1 = 1
+    SHA256 = 2
+
+
+class DisplayDuration(IntEnum):
+    # How long to keep display on? Longer probably drains bit more battery.
+    T_15 = 0
+    T_30 = 1
+    T_60 = 2
+    T_120 = 3
+
+
+def decode_base32(seed: str) -> bytes:
+    # Need to pad with "=" to 8 chars before b32decode works.
+    return b32decode(seed + "=" * (-len(seed) % 8))
+
+
+def enc_simple_tlv(tag: int, value: int | bytes) -> bytes:
+    # Encode ISO/IEC 7816-4 SIMPLE-TLV object. Assume single byte length.
+    if isinstance(value, int):
+        return bytes([tag, 1, value])
+    return bytes([tag, len(value)]) + value
+
+
+def dec_simple_tlv(enc: bytes) -> dict[int, bytes]:
+    # Decoder for SIMPLE-TLV.
+    res = {}
+    buf = bytearray(enc)
+    while buf:
+        tag = buf[0]
+        vlen = buf[1]
+        if len(buf) - 2 < vlen:
+            # Too short.
+            raise ValueError(buf)
+        res[tag] = bytes(buf[2 : 2 + vlen])
+        del buf[: 2 + vlen]
+    return res
+
+
+@dataclass
+class TokenConfig:
+    display_duration: DisplayDuration
+    hmac_algorithm: HmacAlgorithm
+    time_step: TimeStep
+
+    def encode(self, timestamp: int | None = None) -> bytes:
+        # Encode Token config. use current time unless timestamp is given.
+        if timestamp is None:
+            timestamp = round(time())
+
+        return enc_simple_tlv(
+            0x81,
+            enc_simple_tlv(0x1F, self.display_duration)
+            + enc_simple_tlv(0x0F, timestamp.to_bytes(4, "big"))
+            + enc_simple_tlv(
+                0x86,
+                enc_simple_tlv(0x0A, self.hmac_algorithm) + enc_simple_tlv(0x0D, 30 * self.time_step),
+            ),
+        )
+
+
+def pad16(value: bytes) -> bytes:
+    # Apply ISO/IEC 7816-4 padding: Append 0x80 and zero-pad to next multiple of 16 bytes.
+    return value + b"\x80" + bytes(~len(value) % 16)
+
+
+class Token:
+    sm4: SM4Key = SM4Key(b"\212\322\6\210<\243iH*\262q\202\266\350\62$")
+    tag: nfc.tag.Tag
+    info: dict[int, bytes]
+    info_time: float
+
+    def __init__(self, clf: nfc.ContactlessFrontend) -> None:
+        # Try to connect to Token. Can fail.
+
+        target = clf.sense(nfc.clf.RemoteTarget("106A"))
+        if not target:
+            raise NoTokenException()
+
+        self.tag = nfc.tag.activate(clf, target)
+
+        self.select_file()
+        self.get_info()
+
+    def select_file(self) -> None:
+        # Tell Token which java app we want to talk with.
+        self.tag.send_apdu(0x00, 0xA4, 0x04, 0x00, b"\260\0\0\0\0#")
+
+    def get_info(self) -> None:
+        # Read serial and timestamp from Token.
+        resp = self.tag.send_apdu(0x80, 0x41, 0x00, 0x00, b"\2\21")
+        kv = dec_simple_tlv(resp)
+        self.info = dec_simple_tlv(kv[0x95])
+        self.info_time = time()
+
+    @property
+    def serial(self) -> str:
+        # Token serial. is also printed on backside and qrcode.
+        return self.info[2].decode()
+
+    @property
+    def timestamp(self) -> int:
+        # Current UNIX time according to Token.
+        return int.from_bytes(self.info[17], "big")
+
+    @property
+    def time_offset(self) -> float:
+        # Difference between Token time and computer time. Ideally this is near zero.
+        return self.timestamp - self.info_time
+
+    def unlock(self) -> None:
+        # Unlock Token configuration.
+
+        # Token sends us 8 bytes random
+        challenge = self.tag.send_apdu(0x80, 0x4B, 0x08, 0x00, b"")
+
+        # Pad to 16 bytes.
+        challenge.extend(bytes(16 - len(challenge)))
+
+        # Encrypt challenge
+        response = self.sm4.encrypt(bytes(challenge))
+
+        # We send Token the encrypted challenge.
+        self.tag.send_apdu(0x80, 0xCE, 0x00, 0x00, response)
+
+    def send_protected(self, cls: int, ins: int, p1: int, p2: int, data: bytes) -> bytes:
+        # Send a MAC protected message to Token
+        msg = pad16(bytes([0x80, ins, p1, p2, len(data)]) + data)
+        mac = self.sm4.encrypt(msg, initial=bytes(16))[-16:-12]
+        return self.tag.send_apdu(cls, ins, p1, p2, data + mac)
+
+    def write_config(self, config: TokenConfig, timestamp: int | None = None) -> None:
+        # Configure Token. Can remove current seed!
+        self.send_protected(0x84, 0xD4, 0x00, 0x00, config.encode(timestamp))
+
+    def write_seed(self, seed: bytes) -> None:
+        # Write seed to Token.
+        enc_seed = self.sm4.encrypt(pad16(seed))
+        self.send_protected(0x84, 0xC5, 0x01, 0x00, enc_seed)
+
+
+@dataclass
+class Config:
+    usb_major: int
+    usb_minor: int
+    seed: bytes | None
+    loop: bool
+    config: TokenConfig | None
+    timestamp: None | Callable[[], int]
+    debug: bool
+
+    @classmethod
+    def from_args(cls) -> Self:
+        parser = ArgumentParser(
+            description="Programmer for OTPC-P2-i Tokens.",
+            epilog="If any config option (display,hmac,timestep,timestamp,config) is given, write config. "
+            "If seed is given, write seed. "
+            "By default only report serial+timestamp.",
+        )
+        parser.add_argument("--usb-major", "-a", default="04cc", type=str, help="USB Vendor ID [0x04cc]")
+        parser.add_argument("--usb-minor", "-i", default="2533", type=str, help="USB Product ID [0x2533]")
+        parser.add_argument("--seed-hex", "-x", default=None, type=str, help="Seed as Base16 string [None]")
+        parser.add_argument("--seed-b32", "-s", default=None, type=str, help="Seed as Base32 string [None]")
+        parser.add_argument(
+            "--loop",
+            "-l",
+            default=False,
+            action="store_true",
+            help="Run forever. Terminate with ctrl-c. [False]",
+        )
+        parser.add_argument(
+            "--display",
+            "-d",
+            default=None,
+            choices=["15", "30", "60", "120"],
+            help="Number of seconds to keep display on [15]",
+        )
+        parser.add_argument(
+            "--hmac", "-m", default=None, choices=["SHA1", "SHA256"], help="Set HMAC algorithm [SHA1]"
+        )
+        parser.add_argument(
+            "--timestep",
+            "-p",
+            default=None,
+            choices=["30", "60"],
+            help="Number of seconds before new code is created [30]",
+        )
+        parser.add_argument("--timestamp", "-t", default=None, type=int, help="Write fixed timestamp [False]")
+        parser.add_argument(
+            "--timeoffset", "-o", default=None, type=int, help="Write timestamp relative to system time [False]"
+        )
+        parser.add_argument(
+            "--config", "-c", default=False, action="store_true", help="Always write configuration [False]"
+        )
+        parser.add_argument(
+            "--debug", "-v", default=False, action="store_true", help="Output exception tracebacks [False]"
+        )
+        args = parser.parse_args()
+
+        seed = None if args.seed_hex is None else bytes.fromhex(args.seed_hex)
+        if args.seed_b32 is not None:
+            if seed is not None:
+                raise Exception("Can only give one of --seed-hex and --seed-b32!")
+            seed = decode_base32(args.seed_b32)
+
+        if args.config or any(
+            getattr(args, flag) for flag in ["display", "hmac", "timestep", "timestamp", "timeoffset"]
+        ):
+            config = TokenConfig(
+                display_duration=getattr(DisplayDuration, f"T_{args.display or '15'}"),
+                hmac_algorithm=getattr(HmacAlgorithm, args.hmac or "SHA1"),
+                time_step=getattr(TimeStep, f"T_{args.timestep or '30'}"),
+            )
+        else:
+            config = None
+
+        timestamp = None if args.timestamp is None else lambda: args.timestamp
+        if args.timeoffset is not None:
+            if timestamp is not None:
+                raise Exception("Can only give one of --timestamp and --timeoffset")
+            timestamp = lambda: round(time()) + args.timeoffset
+
+        return cls(
+            usb_major=int(args.usb_major, 16),
+            usb_minor=int(args.usb_minor, 16),
+            seed=seed,
+            loop=args.loop,
+            config=config,
+            timestamp=timestamp,
+            debug=args.debug,
+        )
+
+
+def run(clf: nfc.ContactlessFrontend, config: Config) -> None:
+    # Single run of program
+    token = Token(clf)
+    print("Token connected.")
+    print(f"Serial: {token.serial!r}")
+    print(f"Time offset: {token.time_offset:.0f}s")
+
+    if config.config or config.seed:
+        token.unlock()
+
+    if config.config:
+        print("Writing config.")
+        token.write_config(config.config, config.timestamp and config.timestamp())
+
+    if config.seed:
+        print("Writing seed.")
+        token.write_seed(config.seed)
+
+    print("Please remove token from reader...")
+    while True:
+        try:
+            token.select_file()
+        except Exception as ex:
+            break
+        else:
+            sleep(0.2)
+
+
+def main() -> None:
+    config = Config.from_args()
+    clf = nfc.ContactlessFrontend()
+    clf.open(f"usb:{config.usb_major:04x}:{config.usb_minor:04x}")
+
+    while True:
+        print("Waiting for token")
+        try:
+            while True:
+                # Run until first real error or success.
+                try:
+                    run(clf, config)
+                    break
+                except NoTokenException:
+                    sleep(0.1)
+        except Exception as ex:
+            if config.debug:
+                print_exc()
+            else:
+                print(repr(ex), file=stderr)
+        if not config.loop:
+            break
+        sleep(0.2)
+
+
+if __name__ == "__main__":
+    main()
